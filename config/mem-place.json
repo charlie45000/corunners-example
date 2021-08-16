@@ -1,0 +1,41 @@
+{
+  "kdbv": "@KDBV@",
+  "memreport": "@MEMREPORT@",
+  "default_kmemory": "@KMEM_DEF@",
+  "elements": [
+    {
+      "names": [
+        "@CORUNNER_SYMBOL@"
+      ],
+      "type": "corunner",
+      "sections": [
+        {
+          "names": [
+            "DATA",
+            "RODATA",
+            "BSS",
+            "TEXT"
+          ],
+          @CORUNNER_PLACE@
+        }
+      ]
+    },
+    {
+      "names": [
+        "@TASK_MODULES@"
+      ],
+      "type": "task",
+      "sections": [
+        {
+          "names": [
+            "DATA",
+            "RODATA",
+            "BSS",
+            "TEXT"
+          ],
+          @TASK_PLACE@
+        }
+      ]
+    }
+  ]
+}

@@ -4,11 +4,38 @@ import json
 from collections import namedtuple
 import tempfile
 import struct
-import subprocess
+from subprocess import PIPE, run, TimeoutExpired, CalledProcessError
+from string import Template
+from sys import exit, stderr
+from time import sleep
+from io import IOBase
 
 EA = namedtuple("EA", ["source", "target"])
 
-def decode_file(input_file):
+def load_json(f, o=True):
+    if ( isinstance(f, str) or isinstance(f, bytes) ) and not o:
+        return json.loads(f)
+    elif isinstance(f, IOBase):
+        return json.load(f)
+    else:
+        with open(f, 'r') as jf:
+            return json.load(jf)
+
+def dump_json(obj, f=None, s=False):
+    if s:
+        return json.dumps(obj, indent=2)
+    with open(f, 'w') as jf:
+        json.dump(obj, jf, indent=2)
+
+def substi_temp(template, context):
+    return Template(template).substitute(context)
+
+def write_template(output_filename, template, context):
+    output_filename.parent.mkdir(exist_ok=True, parents=True)
+    with open(output_filename, "w") as fileh:
+        fileh.write(substi_temp(template, context))
+
+def decode_file(input_file, timer):
     sorted_data = dict()
 
     # Data format is simple: 16-bits, 16-bits, 32-bits, 64-bits 64-bits
@@ -29,9 +56,9 @@ def decode_file(input_file):
         # Val is the number of quota timer ticks.
         #   Time_s = NbTicks / Freq_Hz
         #
-        # The ticker ticks at 5MHz, hence Freq_Hz = 5e6
+        # The ticker ticks at 5MHz for the MPC5777m and at 75MHz for the P2020.
         # We want a result in ms, so we * 1e3
-        val_ms = float(val) / 5e6 * 1e3
+        val_ms = float(val) / timer * 1e3
         all_time += val_ms
 
         # Esd/Ddl are in ns. Convert to us.
@@ -51,16 +78,14 @@ def decode_file(input_file):
             "dst": dst,
         })
 
-    print(f"{count} measures processed")
-    print(f"{all_time} ms of run-time")
+    print(f"{count} measures processed, {len(contents)}, {input_file}")
+    print(f"{all_time} ms of run-time, with quota timer of {timer:.1E}Mhz")
     return sorted_data
 
 
 def load_db(kdbv, path_to_db):
-    with tempfile.TemporaryFile() as tmp:
-        subprocess.check_call([kdbv, path_to_db], stdout=tmp)
-        tmp.seek(0)
-        return json.load(tmp)
+    proc = run([kdbv, path_to_db], stdout=PIPE, check=True)
+    return load_json(proc.stdout, o=False)
 
 
 def get_nodes_to_ea(args):
@@ -166,3 +191,44 @@ def gen_json_data(data, ea_to_name, out_dir, groups):
 # https://en.wikipedia.org/wiki/Relative_change_and_difference
 def calc(ref, value):
     return (value - ref) / ref * 100.0
+
+def psyko(conf, *cmd_args):
+    cmd = [
+        conf['psyko'],
+        "-K", conf['rtk_dir'],
+        "--product", conf['product'],
+        '--color', 'yes',
+    ] + [*cmd_args]
+    print("[RUN] ", end='')
+    for item in cmd:
+        print(f"'{item}' ", end='')
+    print()
+
+    # Run psyko... This is run in an infinite loop to handle timeouts...
+    # This is especially annoying when you have a weak network connection and
+    # that you fail to request a License. Since running all tests to collect
+    # measures is quite slow, failing because of a timeout on such problems
+    # is quite unpleasant.
+    # So, in case of a network error (highly suggested by the timeout), we
+    # just try again. It's kind of a kludge, but actually saved to much
+    # time.
+    def run_cmd(cmd):
+        try:
+            print(run( cmd, timeout=30, cwd=conf['cwd'], check=True,
+              universal_newlines=True, stderr=PIPE).stderr, file=stderr)
+            return True
+        except TimeoutExpired:
+            return False
+        except CalledProcessError as e:
+            err = e.stderr
+            lmapi = 'Unknown LMAPI error' in err
+            print(err, file=stderr)
+            if lmapi:
+              print('retrying in 60 seconds', file=stderr)
+              sleep(60)
+              return False
+            else:
+              exit("Failed to run psyko")
+
+    while not run_cmd(cmd):
+        pass

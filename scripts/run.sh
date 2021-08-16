@@ -7,34 +7,65 @@ set -u
 # Collect all input parameters via getopt
 ###############################################################################
 
-PSYKO=
-RTK_DIR=
-CMM=
-RUN_TRACE32_HOOK=
-KDBV=
-TYPE=
+PSYKO="${PSYKO:-}"
+RTK_DIR="${RTK:-}"
+RUN_TRACE32_HOOK="${HOOK:-}"
+KDBV="${KDBV:-}"
+TYPE="${TYPE:-}"
+PRODUCT="${PRODUCT:-}"
+P2020="${P2020:-power-qoriq-p2020-ds-p}"
+MPC5777M="${MPC5777M:-power-mpc5777m-evb}"
+ROOT=${ROOT:-`pwd`}
+GENONLY=${GENONLY:-}
 
 usage() {
-  echo "Usage: $0 -T H|G|flash|flash2|Hsram|Gsram -p <psyko> -k <rtk_dir> -t <runner> -d <kdbv> [-h]
+  echo "Usage: $0 -T H|G|U|flash|flash2|Hsram|places.<task>.<test>|cpuPri|l1 -P <psyko> -k <rtk_dir> -t <runner> -d <kdbv> -p <$P2020|$MPC5777M> [-g] [-h]
 
-  -p <psyko>    Path to the PsyC compiler
-  -T H|G|flash|flash2|Hsram|Gsram
+  -P <psyko>    Path to the PsyC compiler
+  -T H|U|G|flash|flash2|Hsram|places<task>.<test>|cpuPri|l1
                 Type of run (required choice)
   -d <kdbv>     Path to the kdbv program
   -k <rtk_dir>  Path to the ASTERIOS RTK
   -t <runner>   Path to the executable to control Trace32
+  -p <product>  Target product
+  -g            Do not run tests, generate results graphs only
   -h            Display this message
+Alternatively you can use the following environment variables to set the required arguments:
+  PSYKO
+  TYPE
+  KDBV
+  RTK
+  HOOK
+  PRODUCT
+  GENONLY
+For the 'places' test:
+  The differents tasks are:
+    H
+    G
+    U
+    flash
+    flash2
+  The differents tests are:
+    R05 for read at 0.5G of the DDR
+    R15 for read at 1.5G of the DDR
+    HL the first core has a higher priority than the second
+    LH the first core has a lower priority than the second
+    S001 the step is 1M
+    S005 the step is 5M
 "
 }
 
 
-while getopts "p:k:c:t:d:T:h" opt; do
+while getopts "P:k:c:t:d:T:p:gh" opt; do
   case $opt in
     h)
       usage
       exit 0
       ;;
-    p)
+    g)
+      GENONLY=1
+      ;;
+    P)
       PSYKO="$OPTARG"
       ;;
     k)
@@ -49,6 +80,11 @@ while getopts "p:k:c:t:d:T:h" opt; do
     T)
       TYPE="$OPTARG"
       ;;
+    p)
+      [ "$OPTARG" != "$P2020" ] && [ "$OPTARG" != "$MPC5777M" ] && \
+        echo "Product error: currently, only power-mpc5777m-evb and power-qoriq-p2020-ds are supported"  && exit 1
+      PRODUCT="$OPTARG"
+      ;;
     *)
       usage
       exit 1
@@ -57,7 +93,7 @@ while getopts "p:k:c:t:d:T:h" opt; do
 done
 
 if [ -z "$PSYKO" ]; then
-  echo "-p <psyko> is required"
+  echo "-P <psyko> is required"
   exit 1
 elif [ -z "$RTK_DIR" ]; then
   echo "-k <rtk_dir> is required"
@@ -68,205 +104,167 @@ elif [ -z "$RUN_TRACE32_HOOK" ]; then
 elif [ -z "$KDBV" ]; then
   echo "-d <kdbv> is required"
   exit 1
+elif [ -z "$PRODUCT" ]; then
+  echo "-p <$P2020|$MPC5777M> is required"
 fi
+
+source "$(pwd)/scripts/run.$PRODUCT.sh"
 
 TRACES_DIR="$(pwd)/traces/${TYPE}"
 BUILD_DIR="$(pwd)/build/${TYPE}"
-OUTDIR=out
+OUTDIR="$ROOT/out_$PRODUCT"
+NO_SEP=
+sym="--symetric"
+rm "$TRACES_DIR/times.log" || true
 
 ###############################################################################
 
 echo "Make sure you have a Trace32 instance ready"
 
-run() {
-  task="$1"
-  core="$2"
-  co_0="$3"
-  co_1="$4"
-  co_2="$5"
-  local_corunners="$6"
-  out="$7"
-  build_dir=$(basename -- "$out")
-  build_dir="$BUILD_DIR/${task}/${build_dir%.*}"
-  extra_opts=
-  if [ "$local_corunners" = "ON" ]; then
-    extra_opts="--local-corunners $extra_opts"
-  fi
-  if [ "$co_0" = "ON" ]; then
-    extra_opts="--corunner-id=0 $extra_opts"
-  fi
-  if [ "$co_1" = "ON" ]; then
-    extra_opts="--corunner-id=1 $extra_opts"
-  fi
-  if [ "$co_2" = "ON" ]; then
-    extra_opts="--corunner-id=2 $extra_opts"
-  fi
-
-  echo "####################################################################"
-
-  # Compile
-  rm -rf "$build_dir"
-  ./build.py \
-    --psyko "$PSYKO" \
-    --rtk-dir "$RTK_DIR" \
-    --task "$task" \
-    --core "$core" \
-    --build-dir "$build_dir" \
-    $extra_opts
-
-  # And now, call a hook script to control the execution of trace32
-  # It shall dump the binary buffer in '$out'.
-  "$RUN_TRACE32_HOOK" "$build_dir/program.elf" "$core" "$out"
+not_supported() {
+  echo "*** $1 is not supported for $PRODUCT" > /dev/stderr
+  exit 1
 }
 
-
-
+generate_R() {
+  extra_args=
+  script="mkdata.py"
+  echo $@
+  if [ "${TYPE%%.*}" = "places" ] || [ "$TYPE" = "cpuPri" ] || [ "$TYPE" = "l1" ] || { [ "$PRODUCT" = "$P2020" ] && [ "$TYPE" = "Hsram" ]; }; then
+    bins="
+                  --traces-dir '$TRACES_DIR' \\
+    "
+    extra_args="
+                  --core $2
+    "
+    script="mkplaces.py"
+    ref="$3"
+    sym=
+  else
+    bins="
+                  --c0-off '$TRACES_DIR/c0-off.bin' \\
+                  --c0-on '$TRACES_DIR/c0-on.bin' \\
+                  --c1-off '$TRACES_DIR/c1-off.bin' \\
+                  --c1-on '$TRACES_DIR/c1-on.bin' \\
+                  --stats \\
+    "
+    ref="c0-off"
+    case "$1" in
+      "FLASH")
+        extra_args="
+                      --c0-on-local '$TRACES_DIR/c0-on-local.bin' \\
+                      --c1-on-local '$TRACES_DIR/c1-on-local.bin'
+        "
+        script="mkcontrol.py"
+        ;;
+      "H")
+        extra_args="
+                      --output-json '$TRACES_DIR/$TYPE.json'
+        "
+        ;;
+    esac
+  fi
+  eval "
+  './scripts/$script' \\
+        \\$bins \\
+        --kdbv '$KDBV' \\
+        --kcfg '$BUILD_DIR/$1/$ref/gen/app/partos/0/dbs/task_$1_kcfg.ks' \\
+        --kapp '$BUILD_DIR/$1/$ref/gen/app/config/kapp.ks' \\
+        --output-dir '$OUTDIR/$TYPE' --task=$1 \\
+        --product '$PRODUCT'\\
+        --timer '$timer' \\
+        $sym \\
+        \\$extra_args
+  "
+   cd "$OUTDIR/$TYPE"
+   R --no-save < plot.R
+}
 if [ "x$TYPE" = x"flash" ]; then
-  #   Task  Core C0  C1  C2  Local
-  run FLASH 1    OFF OFF OFF OFF "$TRACES_DIR/c0-off.bin"
-  run FLASH 1    OFF OFF ON  ON  "$TRACES_DIR/c0-on-local.bin"
-  run FLASH 1    OFF OFF ON  OFF "$TRACES_DIR/c0-on.bin"
-  run FLASH 2    OFF OFF OFF OFF "$TRACES_DIR/c1-off.bin"
-  run FLASH 2    OFF ON  OFF ON  "$TRACES_DIR/c1-on-local.bin"
-  run FLASH 2    OFF ON  OFF OFF "$TRACES_DIR/c1-on.bin"
-
-  echo "
-  ========= To generate the images ==========
-  '$(pwd)/scripts/mkcontrol.py' \
-                  --c0-off '$TRACES_DIR/c0-off.bin' \
-                  --c0-on-local '$TRACES_DIR/c0-on-local.bin' \
-                  --c0-on '$TRACES_DIR/c0-on.bin' \
-                  --c1-off '$TRACES_DIR/c1-off.bin' \
-                  --c1-on-local '$TRACES_DIR/c1-on-local.bin' \
-                  --c1-on '$TRACES_DIR/c1-on.bin' \
-                  --kdbv '$KDBV' \
-                  --kcfg '$BUILD_DIR/FLASH/c0-off/gen/app/partos/0/dbs/task_FLASH_kcfg.ks' \
-                  --kapp '$BUILD_DIR/FLASH/c0-off/gen/app/config/kapp.ks' \
-                  --output-dir '$OUTDIR/flash' --task=FLASH --stats
-   cd '$OUTDIR/flash'
-   R --no-save < plot.R
-  ===========================================
-  "
+  cmd='run_flash'
+  r_args='FLASH'
 elif [ "x$TYPE" = x"flash2" ]; then
-  #   Task  Core C0  C1  C2  Local
-  run FLASH 1    OFF OFF OFF OFF "$TRACES_DIR/c0-off.bin"
-  run FLASH 1    ON  OFF ON  ON  "$TRACES_DIR/c0-on-local.bin"
-  run FLASH 1    ON  OFF ON  OFF "$TRACES_DIR/c0-on.bin"
-  run FLASH 2    OFF OFF OFF OFF "$TRACES_DIR/c1-off.bin"
-  run FLASH 2    ON  ON  OFF ON  "$TRACES_DIR/c1-on-local.bin"
-  run FLASH 2    ON  ON  OFF OFF "$TRACES_DIR/c1-on.bin"
-
-  echo "
-  ========= To generate the images ==========
-  '$(pwd)/scripts/mkcontrol.py' \
-                  --c0-off '$TRACES_DIR/c0-off.bin' \
-                  --c0-on-local '$TRACES_DIR/c0-on-local.bin' \
-                  --c0-on '$TRACES_DIR/c0-on.bin' \
-                  --c1-off '$TRACES_DIR/c1-off.bin' \
-                  --c1-on-local '$TRACES_DIR/c1-on-local.bin' \
-                  --c1-on '$TRACES_DIR/c1-on.bin' \
-                  --kdbv '$KDBV' \
-                  --kcfg '$BUILD_DIR/FLASH/c0-off/gen/app/partos/0/dbs/task_FLASH_kcfg.ks' \
-                  --kapp '$BUILD_DIR/FLASH/c0-off/gen/app/config/kapp.ks' \
-                  --output-dir '$OUTDIR/flash2' --task=FLASH --stats
-   cd '$OUTDIR/flash2'
-   R --no-save < plot.R
-  ===========================================
-  "
+  cmd='run_flash2'
+  r_args='FLASH'
 elif [ "x$TYPE" = x"G" ]; then
-  #   Task Core C0  C1  C2  Local
-  run G    1    OFF OFF OFF OFF "$TRACES_DIR/c0-off.bin"
-  run G    1    OFF OFF ON  OFF "$TRACES_DIR/c0-on.bin"
-  run G    2    OFF OFF OFF OFF "$TRACES_DIR/c1-off.bin"
-  run G    2    OFF ON  OFF OFF "$TRACES_DIR/c1-on.bin"
-
-  echo "
-  ========= To generate the images ==========
-   '$(pwd)/scripts/mkdata.py' \
-                  --c0-off '$TRACES_DIR/c0-off.bin' \
-                  --c0-on '$TRACES_DIR/c0-on.bin' \
-                  --c1-off '$TRACES_DIR/c1-off.bin' \
-                  --c1-on '$TRACES_DIR/c1-on.bin' \
-                  --kdbv '$KDBV' \
-                  --kcfg '$BUILD_DIR/G/c0-off/gen/app/partos/0/dbs/task_G_kcfg.ks' \
-                  --kapp '$BUILD_DIR/G/c0-off/gen/app/config/kapp.ks' \
-                  --output-dir '$OUTDIR/G' --task=G --stats
-   cd '$OUTDIR/G'
-   R --no-save < plot.R
-  ===========================================
-  "
+  cmd='run_G'
+  r_args='G'
+elif [ "x$TYPE" = x"U" ]; then
+  STUBBORN_MAX_MEASURES=512
+  cmd='run_U'
+  r_args='U'
 elif [ "x$TYPE" = x"H" ]; then
-  #   Task Core C0  C1  C2  Local
-  run H    1    OFF OFF OFF OFF "$TRACES_DIR/c0-off.bin"
-  run H    1    OFF OFF ON  OFF "$TRACES_DIR/c0-on.bin"
-  run H    2    OFF OFF OFF OFF "$TRACES_DIR/c1-off.bin"
-  run H    2    OFF ON  OFF OFF "$TRACES_DIR/c1-on.bin"
-
-  echo "
-  ========= To generate the images ==========
-   '$(pwd)/scripts/mkdata.py' \
-                  --c0-off '$TRACES_DIR/c0-off.bin' \
-                  --c0-on '$TRACES_DIR/c0-on.bin' \
-                  --c1-off '$TRACES_DIR/c1-off.bin' \
-                  --c1-on '$TRACES_DIR/c1-on.bin' \
-                  --kdbv '$KDBV' \
-                  --kcfg '$BUILD_DIR/H/c0-off/gen/app/partos/0/dbs/task_H_kcfg.ks' \
-                  --kapp '$BUILD_DIR/H/c0-off/gen/app/config/kapp.ks' \
-                  --output-dir '$OUTDIR/H' --task=H \
-                  --stats --output-json '$TRACES_DIR/H.json'
-   cd '$OUTDIR/H'
-   R --no-save < plot.R
-  ===========================================
-  "
+  cmd='run_H'
+  r_args='H'
 elif [ "x$TYPE" = x"Hsram" ]; then
-  #   Task Core C0  C1  C2  Local
-  run H    1    OFF OFF OFF OFF "$TRACES_DIR/c0-off.bin"
-  run H    1    ON  OFF ON  OFF "$TRACES_DIR/c0-on.bin"
-  run H    2    OFF OFF OFF OFF "$TRACES_DIR/c1-off.bin"
-  run H    2    ON  ON  OFF OFF "$TRACES_DIR/c1-on.bin"
+  STUBBORN_MAX_MEASURES=256
+  NO_SEP=ON
+  t='U'
+  ref="${t}SRAM-COFF"
+  cmd='run_Hsram'
+  if [ "$PRODUCT" = "$P2020" ]; then
+    cmd+="  0 $t"
+    r_args="$t 0 $ref"
+  else
+    r_args='H'
+  fi
+elif [ "x${TYPE%%.*}" = x"places" ]; then
+  STUBBORN_MAX_MEASURES=256
+  t=${TYPE#*.}
+  spec=${t#*.}
+  t=${t%.*}
+  case $spec in
+    "R05")
+      #Default value
+      #CORUNNER_READ_0="0x20000000"
+      #CORUNNER_READ_1="0x20000000"
+      ;;
+    "R15")
+      CORUNNER_READ_0="0x60000000"
+      CORUNNER_READ_1="0x60000000"
+      ;;
+    "LH")
+      EEBPCR="03000002"
+      export EEBPCR
+      ;;
+    "HL")
+      EEBPCR="03000020"
+      export EEBPCR
+      ;;
+    "S001")
+      DDR_SIZE=268435456
+      STEP_START=125
+      LAST_ADDR=268435456
+      step=1073741.824
+      ;;
+    "S005")
+      DDR_SIZE=268435456
+      STEP_START=25
+      LAST_ADDR=268435456
+      step=5368709.12
+      ;;
+esac
 
-  echo "
-  ========= To generate the images ==========
-   '$(pwd)/scripts/mkdata.py' \
-                  --c0-off '$TRACES_DIR/c0-off.bin' \
-                  --c0-on '$TRACES_DIR/c0-on.bin' \
-                  --c1-off '$TRACES_DIR/c1-off.bin' \
-                  --c1-on '$TRACES_DIR/c1-on.bin' \
-                  --kdbv '$KDBV' \
-                  --kcfg '$BUILD_DIR/H/c0-off/gen/app/partos/0/dbs/task_H_kcfg.ks' \
-                  --kapp '$BUILD_DIR/H/c0-off/gen/app/config/kapp.ks' \
-                  --output-dir '$OUTDIR/Hsram' --task=H \
-                  --stats --output-json '$TRACES_DIR/Hsram.json'
-   cd '$OUTDIR/Hsram'
-   R --no-save < plot.R
-  ===========================================
-  "
-
-elif [ "x$TYPE" = x"Gsram" ]; then
-  #   Task Core C0  C1  C2  Local
-  run G    1    OFF OFF OFF OFF "$TRACES_DIR/c0-off.bin"
-  run G    1    ON  OFF ON  OFF "$TRACES_DIR/c0-on.bin"
-  run G    2    OFF OFF OFF OFF "$TRACES_DIR/c1-off.bin"
-  run G    2    ON  ON  OFF OFF "$TRACES_DIR/c1-on.bin"
-
-  echo "
-  ========= To generate the images ==========
-   '$(pwd)/scripts/mkdata.py' \
-                  --c0-off '$TRACES_DIR/c0-off.bin' \
-                  --c0-on '$TRACES_DIR/c0-on.bin' \
-                  --c1-off '$TRACES_DIR/c1-off.bin' \
-                  --c1-on '$TRACES_DIR/c1-on.bin' \
-                  --kdbv '$KDBV' \
-                  --kcfg '$BUILD_DIR/G/c0-off/gen/app/partos/0/dbs/task_G_kcfg.ks' \
-                  --kapp '$BUILD_DIR/G/c0-off/gen/app/config/kapp.ks' \
-                  --output-dir '$OUTDIR/Gsram' --task=G \
-                  --stats --output-json '$TRACES_DIR/Gsram.json'
-   cd '$OUTDIR/Gsram'
-   R --no-save < plot.R
-  ===========================================
-  "
-
+  step=${step:-}
+  ref="${t}05-COFF"
+  cmd="run_places 0 $t $step"
+  r_args="$t 0 $ref"
+elif [ "x$TYPE" = x"cpuPri" ]; then
+  STUBBORN_MAX_MEASURES=256
+  ref="ref-coff"
+  cmd="run_cpu_pri 0 H"
+  r_args="U 0 $ref"
+elif [ "x$TYPE" = x"l1" ]; then
+  NO_SEP=ON
+  STUBBORN_MAX_MEASURES=256
+  ref="H-COFF"
+  cmd="run_l1 0 H"
+  r_args="H 0 $ref"
 else
   echo "*** Unknown argument '$TYPE'"
   exit 1
 fi
+
+export NO_SEP
+export STUBBORN_MAX_MEASURES
+[ -z "$GENONLY" ] && eval "$cmd"
+generate_R $r_args

@@ -1,125 +1,66 @@
 #! /usr/bin/env python3
 
 import argparse
-import os
 from pathlib import Path
-from string import Template
 import subprocess
 import sys
+import scripts.templates
+from scripts.templates import P2020, MPC5777M, CORES, TOP_DIR, PSY_DIR, STUBS_DIR, SRC_DIR, CFG_DIR, Help, AGENT_CONFIG_HJSON_TEMPLATE, CORUNNER_CONFIG_HJSON_TEMPLATE, CORUNNER_KMEMORY_JSON_TEMPLATE, COMPILE_CONFIG_HJSON_TEMPLATE, PSYMODULE_CONFIG_HJSON_TEMPLATE, FLASHLIKE
+from scripts.scriptutil import load_db, load_json, dump_json, write_template, psyko
+from operator import itemgetter
 
-TOP_DIR = Path(__file__).parent.resolve()
-PSY_DIR = TOP_DIR / "psy"
-SRC_DIR = TOP_DIR / "src"
-CFG_DIR = TOP_DIR / "config"
-STUBS_DIR = TOP_DIR / "psy" / "stubs"
+def corunner_to_list(s):
+    """
+    This function takes the corunner string (a comma separated list: <core>,<start address of read>) and returns a python list of the same form (with none as second element if there is only a core). This allows to set a start address for each corunner in case there is at least two.
+    Should not be used except as an argument parser type.
+    """
+    pars = s.split(',')
+    pars[0] = int(pars[0])
+    assert pars[0] in CORES, \
+        f"The corunner id must be one of {CORES.join(', ')}"
+    l = len(pars)
+    if l > 2:
+        raise argparse.ArgumentTypeError("Corunners parameters must be of type <core>[,<start address of read>]")
+    elif l == 2 and pars[1] != '':
+        return pars
+    else:
+        return [pars[0], None]
 
-AGENT_CONFIG_HJSON_TEMPLATE = """
-{
-    app: {
-        agents: [
-            {
-                name: $agent_name
-                core: $agent_core
-            }
-        ]
-    }
-}
-"""
-
-CORUNNER_CONFIG_HJSON_TEMPLATE = """
-{
-    app: {
-        cores: [
-            {
-                id: ${corunner_id}
-                co_runner: {
-                    symbol: ${corunner_symbol}
-                    object: ${corunner_object}
-                }
-            }
-        ]
-    }
-}
-"""
-
-COMPILE_CONFIG_HJSON_TEMPLATE = """
-{
-    compile: {
-        cflags: [
-            "-g2",
-            "-Xdebug-dwarf2",
-            "-Xdebug-local-cie",
-            "-Xdialect-c99",
-            "-X230=1",
-            "-X43=0", # Do not insert eieio !
-            """ + f'''"-I", "{TOP_DIR}/include",''' + """
-        ]
-    }
-}
-"""
-
-PSYMODULE_CONFIG_HJSON_TEMPLATE = """
-{
-    psymodule: {
-        psy_pp_flags: [
-            "-I", "include",
-        ]
-        cflags: [
-            "-g2",
-            "-Xdebug-dwarf2",
-            "-Xdebug-local-cie",
-            "-Xdialect-c99",
-            "-X230=1",
-            "-X43=0", # Do not insert eieio !!
-            """ + f'''"-I", "{TOP_DIR}/include",''' + """
-        ]
-    }
-}
-"""
-
-class Help:
-    RTK_DIR = "Path to the ASTERIOS RTK"
-    CORUNNER_ID = "ID of the co-runner to enable; can be specified multiple times"
-    TASK = "Name of the nominal task to be compiled for execution"
-    PSYKO = "Path to the PsyC Compiler psyko"
-    BUILD_DIR = "Path to the build directory in which artifacts are produced"
-    CORE = "ID of the core on which the task will run; must not conflict with --corunner-id"
-    LOCAL_CORUNNERS = "If set, co-runners will be configured to only access local memories"
-    OUTPUT = "Path where the executable is to be generated"
-    PRODUCT = "Name of the ASTERIOS RTK Product"
+def cor_cores(cors):
+    """
+    Takes a list returned by corunner_to_list and returns a list containing only the cores in the same order (to know which cores are used).
+    """
+    return [i[0] for i in cors]
 
 def getopts(argv):
     parser = argparse.ArgumentParser(description='Corunners builder')
     parser.add_argument("--psyko", "-P", type=Path,
                         help=Help.PSYKO, required=True)
+    parser.add_argument("--kdbv", type=Path, required=True)
     parser.add_argument("--rtk-dir", "-K", type=Path,
                         help=Help.RTK_DIR, required=True)
     parser.add_argument("--product", "-p", type=str,
-                        help=Help.PRODUCT, default="power-mpc5777m-evb")
-    parser.add_argument("--corunner-id", "-C", type=int, choices=[0, 1, 2],
-                        action="append", help=Help.CORUNNER_ID, default=[])
-    parser.add_argument("--task", "-T", type=str, choices=["H", "G", "FLASH"],
+                        help=Help.PRODUCT,  required=True,
+                        choices=[P2020,MPC5777M])
+    parser.add_argument("--corunner", "-C", type=corunner_to_list,
+                        action="append", help=Help.CORUNNER, default=[])
+    parser.add_argument("--task", "-T", type=str, choices=["H", "G"]+FLASHLIKE,
                         help=Help.TASK, required=True)
-    parser.add_argument("--core", "-c", type=int, choices=[0, 1, 2],
+    parser.add_argument("--core", "-c", type=int, choices=CORES,
                         help=Help.CORE, required=True)
     parser.add_argument("--local-corunners", action='store_true',
                         help=Help.LOCAL_CORUNNERS)
     parser.add_argument("--build-dir", type=Path, default=TOP_DIR / "build",
                         help=Help.BUILD_DIR)
+    parser.add_argument("--mem-conf", type=Path,
+                        help=Help.MEM_CONF)
     parser.add_argument("--output", "-o", type=Path,
                         help=Help.OUTPUT)
     args = parser.parse_args(argv[1:])
-    assert not args.core in args.corunner_id
+    assert args.core not in cor_cores(args.corunner)
     if args.output is None:
         args.output = args.build_dir / "program.elf"
     return args
-
-
-def write_template(output_filename, template, context):
-    output_filename.parent.mkdir(exist_ok=True, parents=True)
-    with open(output_filename, "w") as fileh:
-        fileh.write(Template(template).substitute(context))
-
 
 def gen_agent_config(output_filename, name, core):
     write_template(output_filename, AGENT_CONFIG_HJSON_TEMPLATE, {
@@ -127,24 +68,57 @@ def gen_agent_config(output_filename, name, core):
         "agent_core": core,
     })
 
-
-def gen_corunner_config(output_filename, identifier, symbol, object_file):
-    write_template(output_filename, CORUNNER_CONFIG_HJSON_TEMPLATE, {
+def gen_corunner_config(conf_filename, identifier, symbol, object_file, kmem_filename):
+    write_template(conf_filename, CORUNNER_CONFIG_HJSON_TEMPLATE, {
         "corunner_id": identifier,
         "corunner_symbol": symbol,
         "corunner_object": str(object_file)
     })
+    write_template(kmem_filename, CORUNNER_KMEMORY_JSON_TEMPLATE, {
+        'symbol': symbol,
+    })
 
-
-def gen_corunner_source(output_filename, symbol, *, sram=False):
+def gen_corunner_source(output_filename, symbol, read=dict()):
     cmd = [sys.executable, TOP_DIR / "scripts" / "gen-corunner.py", symbol]
-    if sram:
-        cmd += ["--sram"]
+    if read:
+        cmd += ["--read"]
+        if 'nop' in read:
+          cmd += ["--nop", str(read['nop'])]
+        if 'start' in read:
+          cmd += ["--startaddr", str(read['start'])]
+        if 'size' in read:
+          cmd += ["--tablesize", str(read['size'])]
+        if 'stride' in read:
+          cmd += ["--stride", str(read['stride'])]
     else:
         cmd += ["--jump", "2048"]
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True) as proc:
         with open(output_filename, "w") as fileh:
             fileh.write(proc.stdout.read())
+
+def gen_kmem_final(default, config, memreport, kdbv, tasks, corunners=list()):
+    config_json = load_json(config)
+    cmd = [sys.executable, TOP_DIR / 'scripts' / 'gen-kmem.py', '--config', config]
+    del_list = []
+    config_json['memreport'] = str(memreport)
+    config_json['default_kmemory'] = str(default)
+    for el in config_json['elements']:
+        if el['type'] == 'corunner':
+            if corunners:
+                el['names'] = corunners
+            else:
+                del_list.append(el)
+        elif el['type'] == 'task':
+            el['names'] = tasks
+        else:
+            del_list.append(el)
+    for el in del_list:
+        config_json['elements'].remove(el)
+
+
+    dump_json(config_json, config)
+
+    ret = subprocess.check_call(cmd)
 
 def get_sources(task_name):
     c_sources = [
@@ -152,9 +126,8 @@ def get_sources(task_name):
         SRC_DIR / "filter.c",
         SRC_DIR / "filter2.c",
     ]
-    asm_sources = []
     psy_sources = [PSY_DIR / f"task_{task_name}.psy"]
-    if task_name != "FLASH":
+    if task_name not in FLASHLIKE:
         c_sources += [
             STUBS_DIR / f"suite_task_{task_name}.c",
         ]
@@ -170,108 +143,129 @@ def get_sources(task_name):
 def main(argv):
     args = getopts(argv)
 
+    used_cores = cor_cores(args.corunner) + [args.core]
+    args.corunner.sort(key=itemgetter(0))
+
     def object_of(source_filename, extension = ".o"):
         return args.build_dir / (source_filename.name + extension)
-
 
     sources = get_sources(args.task)
 
     ag_config = args.build_dir / "task.hjson"
     app_configs = [
-        CFG_DIR / "app.hjson",
+        args.build_dir / "app.hjson",
         CFG_DIR / f"task_{args.task}.hjson",
         ag_config,
     ]
+    tasks = [f'task_{args.task}']
+    part_configs = []
     compile_config = args.build_dir / "compile.hjson"
+    partition_config = args.build_dir / "partition.hjson"
     psymodule_config = args.build_dir / "psymodule.hjson"
     gen_agent_config(ag_config, f"task_{args.task}", args.core)
-    for corunner in args.corunner_id:
+    mem_configs = []
+    corunners = []
+    for corunner,  cor_start in args.corunner:
+        # The read corunner is created only if a start address si provided for this corunner.
+        use_read = bool(cor_start)
+        read_args = dict()
         co_config = args.build_dir / f"corunner_{corunner}.hjson"
-        co_obj = args.build_dir / f"corunner_{corunner}.asm"
-        use_sram = corunner == 0
-        symbol = f"co_runner_sram{corunner}" if use_sram else f"co_runner_flash{corunner}"
-        app_configs.append(co_config)
-        sources["asm"].append(co_obj)
-        gen_corunner_config(co_config, corunner, symbol, object_of(co_obj))
-        gen_corunner_source(co_obj, symbol, sram=use_sram)
+        co_kmem = args.build_dir / f"corunner_{corunner}_kmem.json"
+        co_file = args.build_dir / f"corunner_{corunner}"
+        if use_read:
+            read_args['start'] = cor_start
+            read_args['size'] = int(env.get(f"CORUNNER_READ_SIZE_{corunner}", "0x2000"), 16)
+        symbol = f"co_runner_read{corunner}" if read_args else f"co_runner_flash{corunner}"
+        co_file = co_file.with_suffix('.asm')
+        sources["asm"].append(co_file)
+        gen_corunner_source(co_file, symbol, read_args)
 
-    if args.task != "FLASH":
+        app_configs.append(co_config)
+        mem_configs.append(co_kmem)
+        corunners.append(symbol)
+        gen_corunner_config(co_config, corunner, symbol, object_of(co_file), co_kmem)
+
+    if args.task not in FLASHLIKE:
         stub_config = args.build_dir / "stub.hjson"
         gen_agent_config(stub_config, f"sends_to_task_{args.task}", args.core)
         app_configs.append(stub_config)
+        tasks.append(f'sends_to_task_{args.task}')
 
     write_template(compile_config, COMPILE_CONFIG_HJSON_TEMPLATE, {})
     write_template(psymodule_config, PSYMODULE_CONFIG_HJSON_TEMPLATE, {})
-
 
 
     #==========================================================================
     # The functions below are just helpers to call the PsyC compiler psyko,
     # with a convenient access to global variables such as the path to the
     # compiler and the path to the RTK.
-    def psyko(*cmd_args):
-        env = os.environ
-        env.pop("PLACE_CO_RUNNERS_LOCALLY", None)
-        env["CORE_USED"] = f"{args.core}"
-        if args.local_corunners:
-            env["PLACE_CO_RUNNERS_LOCALLY"] = "1"
-
-        cmd = [
-            args.psyko,
-            "-K", args.rtk_dir,
-            "--product", args.product,
-        ] + [*cmd_args]
-        print("[RUN] ", end='')
-        for item in cmd:
-            print(f"'{item}' ", end='')
-        print()
-
-        # Run psyko... This is run in an infinite loop to handle timeouts...
-        # This is especially annoying when you have a weak network connection and
-        # that you fail to request a License. Since running all tests to collect
-        # measures is quite slow, failing because of a timeout on such problems
-        # is quite unpleasant.
-        # So, in case of a network error (highly suggested by the timeout), we
-        # just try again. It's kind of a kludge, but actually saved to much
-        # time.
-        def run_cmd(cmd):
-            try:
-                ret = subprocess.run(
-                    cmd, timeout=30, cwd=TOP_DIR, env=env, universal_newlines=True)
-                assert ret.returncode == 0, "Failed to run psyko"
-                return True
-            except subprocess.TimeoutExpired:
-                return False
-
-        while not run_cmd(cmd):
-            pass
-
+    psykonf = {'product': args.product, 'rtk_dir': args.rtk_dir, 'psyko': args.psyko, 'cwd': TOP_DIR}
     def psyko_cc(c_source):
         generated_object = object_of(c_source)
-        psyko("cc", c_source, compile_config, "-o", generated_object)
+        psyko(psykonf, "cc", c_source, compile_config, "-o", generated_object)
         return generated_object
 
     def psyko_as(asm_source):
         generated_object = object_of(asm_source)
-        psyko("as", asm_source, compile_config, "-o", generated_object)
+        psyko(psykonf, "as", asm_source, compile_config, "-o", generated_object)
         return generated_object
 
     def psyko_module(psy_source):
         generated_object = object_of(psy_source, ".psyo")
-        psyko("module", psy_source, psymodule_config, "-o", generated_object)
+        psyko(psykonf, "module", psy_source, psymodule_config, "-o", generated_object)
         return generated_object
 
-    def psyko_partition(name, objects):
+    def psyko_partition(name, objects, configs):
         generated_object = args.build_dir / (name + ".parto")
-        psyko("partition", "-o", generated_object, *objects)
+        psyko(psykonf, "partition", "-o", generated_object, '--gendir',
+              args.build_dir / 'gen' / 'part', *objects, *configs)
         return generated_object
 
     def psyko_app(partos, configs):
         elf = args.build_dir / "program.elf"
-        psyko("app", "-a", args.build_dir / "program.app", "-b", args.output,
-              '--gendir', args.build_dir / "gen" / "app",
-              *partos, *configs)
-        return elf
+        gendir = args.build_dir / "gen" / "app"
+        psyko(psykonf, "app", "-a", args.build_dir / "program.app", "-b", args.output,
+              '--gendir', gendir, *partos, *configs)
+        return gendir
+    def psyko_memconf(t, files, configs=[], cor_kmems=[]):
+        """
+        This function generates a valid default memconf used to perform the first compilation. It creates a default kmemory for the task and adds the configs for all the corunners.
+        """
+        kmemconf = args.build_dir / ('kmemconf_'+t+'.json')
+        psyko(psykonf, 'gen-mem-conf', '-t', t, '--gendir', args.build_dir / 'gen' / 'memconf', '-o', kmemconf, *files, *configs)
+
+        if cor_kmems:
+            def_memconf = load_json(kmemconf)
+            cor_memconf = []
+            for kmem in cor_kmems:
+                cor_memconf.append(load_json(kmem))
+            max_reg = def_memconf['kmemory']['regions'][0]
+            if len(def_memconf['kmemory']['regions']) > 1:
+                for reg in def_memconf['kmemory']['regions'][1:]:
+                    if reg['size'] > max_reg['size']:
+                        max_reg = reg
+            if 'domains' not in max_reg:
+                max_reg['domains'] = []
+                out = cor_memconf[0]['domains'][0]['output_sections'][0]
+                out['physical_address'] = mar_reg['physical_address']
+            stacks = {obj['id']: obj
+                for obj in def_memconf['kmemory']['objects']
+                if obj['id'] in [f"core_{core}_co_runner_stack.c"
+                    for core in used_cores]}
+            for core in cor_cores(args.corunner):
+                stack = f"core_{core}_co_runner_stack.c"
+                for corunner in corunners:
+                   symbol = corunner if corunner[-1] == str(core) else ''
+
+                stacks[stack]['groups'] = [f'.stack_{symbol}']
+
+            for cor in cor_memconf:
+                max_reg['domains'] += cor['domains']
+                def_memconf['kmemory']['groups'] += cor['groups']
+                def_memconf['kmemory']['objects'] += cor['objects']
+            dump_json(def_memconf, f=kmemconf)
+
+        return kmemconf
 
     #==========================================================================
     # Compile all the C, ASM and PsyC sources.
@@ -285,10 +279,19 @@ def main(argv):
         parto_objects.append(psyko_module(psy_source))
 
     #==========================================================================
-    # Finally, generate a single partition, and then the final executable
-    parto = psyko_partition("main", parto_objects)
-    psyko_app([parto], app_configs)
-    assert args.output.is_file()
+    # Generate a single partition, and then executable to be able to get the size of the sections
+    parto = psyko_partition("main", parto_objects, part_configs)
+    mem_configs = [psyko_memconf('app', [parto], app_configs, mem_configs)]
+    mem_configs.append("--overwrite-memory-configuration")
+    gendir = psyko_app([parto], app_configs+mem_configs)
+    assert args.output.is_file(), "first app compilation not successfull"
+    # Finally generate the final memory configs and the executable
+    if args.mem_conf:
+      args.output.unlink()
+      gen_kmem_final(mem_configs[0], args.mem_conf,
+          gendir / 'applink' / 'memreport_out.ks', args.kdbv, tasks, corunners)
+      psyko_app([parto], app_configs+mem_configs)
+      assert args.output.is_file(), "final app compilation not successfull"
 
 if __name__ == "__main__":
     main(sys.argv)

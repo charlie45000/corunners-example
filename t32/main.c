@@ -11,18 +11,20 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 
+#define BUFF_EL_SIZE 24
 #define ERR(Fmt, ...) fprintf(stderr, "*** " Fmt "\n", ## __VA_ARGS__)
+#define LOG(file, Fmt, ...) fprintf(file, "*** " Fmt "\n", ## __VA_ARGS__)
 #define DIE(Code, Fmt, ...) \
   do { \
     fprintf(stderr, "*** " Fmt " (error code: %i)\n", ## __VA_ARGS__, Code); \
+    free(BUFFER); \
     exit(Code); \
   } while (0)
 
 
-/* We have a buffer of 1024 elements, each element being a structure of size
- * 24.  These are hard-coded parameters, not that great, but it will do */
-static uint8_t BUFFER[1024 * 24];
+static uint8_t *BUFFER;
 
 
 /**
@@ -162,13 +164,26 @@ static void wait_practise(const int delay_s)
  * Make Trace32 go to the next breakpoint.
  * This synchronouly wait for the execution to complete, WITHOUT TIMEOUT.
  */
-static void next(void)
+static int next(void)
 {
-  const int ret = T32_Go();
+  uint32_t pp;
+  char symbol[0xfc];
+  int ret = T32_Go();
   if (ret != T32_OK)
   { DIE(ret, "Failed to advance after breakpoint"); }
   printf("Going to next breakpoint..."); fflush(stdout);
   wait_exec(5);
+  ret = T32_ReadPP(&pp);
+  if (ret != T32_OK)
+  { ERR("Failed to retrieve curent program pointer. Error code: %d", ret); }
+  ret = T32_GetSymbolFromAddress(symbol, pp, (int)0xfc);
+  if (ret != T32_OK)
+  { ERR("Failed to retrieve curent function symbol. Error code: %d", ret); }
+  printf("Currently at %s (%08X). ", symbol, pp); fflush(stdout);
+
+  if(! strcmp(symbol, "em_raise") || ! strcmp(symbol, "em_early_raise"))
+  { printf("\n"); return 1; }
+  else return 0;
 }
 
 /**
@@ -226,18 +241,36 @@ static uint32_t read_u32(const char *const name)
 int main(const int argc, const char *const argv[argc])
 {
   /* Trivial getopts */
-  if (argc != 3)
+  if (argc != 4)
   {
-    ERR("Usage: %s <script.cmm> <output.bin>", argv[0]);
+    ERR("Usage: %s <script.cmm> <output.bin> <logfile>", argv[0]);
     return 1;
   }
   const char *const script = argv[1];
   const char *const output = argv[2];
+  const char *const logfile = argv[3];
+  struct timeval stop, start;
+  const char *const envval = getenv("STUBBORN_MAX_MEASURES");
+  unsigned int buff_len = 1024u;
+  /* We have a buffer of n elements (1024 by default), each element being a
+   * structure of size 24.  These are hard-coded parameters, not that great, but *
+   * it will do */
+  if(envval)
+  {
+    if(sscanf(envval, "%u", &buff_len) != 1)
+    { buff_len = 1024u; }
+  }
+
+  if((BUFFER=calloc(buff_len, BUFF_EL_SIZE)) == NULL)
+  { DIE(errno, "Could not allocate the buffer: %s", strerror(errno)); }
+
+  buff_len *= BUFF_EL_SIZE;
 
   /* Make sure we will (almost) always terminate the program by leaving T32 in
    * a clean state. */
   atexit(&cleanup);
   set_signal_handler(SIGINT);
+  set_signal_handler(SIGTERM);
 
   int ret;
 
@@ -259,41 +292,49 @@ int main(const int argc, const char *const argv[argc])
   run_script(script);
 
   /* Make sure the board is reset... otherwise it may not work... */
-  in_target_reset();
+  //in_target_reset();
 
-  /* At this point, we are waiting at a breakpoint (startup). */
-  next();
-  /* Now, we should be at k2_init. The next one will be em_raise() */
-  next();
+  gettimeofday(&start, NULL);
+  /* At this point, we are waiting at breakpoints, and check each time if we reached an error function.*/
+  while(! next()){ }
+
+  //calculate the execution time of the task.
+  gettimeofday(&stop, NULL);
 
   /* Okay, at this point trace32 is at the em_raise breakpoint. First check
    * that the error code is the one we expect from normal termination: */
   const uint32_t error = read_u32("error_id");
   if (error != 0x00030009)
-  { DIE(-1, "Error ID expected is '0x%x' but we have '0x%x'", 0x00030009, error) ; }
+  { DIE(-1, "Error ID expected is '0x%08X' but we have '0x%08X'", 0x00030009, error); }
 
   /* Now, retrieve the address of the buffer holding measures */
   const uint32_t address = read_u32("&k2_stubborn_measures");
 
   /* Retrieve the profiling buffer in-memory */
-  ret = T32_ReadMemory(address, 0x0, BUFFER, sizeof(BUFFER));
+  ret = T32_ReadMemory(address, 0x0, BUFFER, buff_len);
   if (ret != T32_OK)
-  { DIE(ret, "Failed to read memory from address 0x%x", address); }
+  { DIE(ret, "Failed to read memory from address 0x%08X", address); }
 
   /* And finally, dump the profiling buffer to the local filesystem */
-  FILE *const file = fopen(output, "wb");
+  FILE *file = fopen(output, "wb");
   if (! file)
   {
     const int err = errno;
     DIE(err, "Failed to open '%s' for writing: %s", output, strerror(err));
   }
-  if (fwrite(BUFFER, 1, sizeof(BUFFER), file) != sizeof(BUFFER))
+  if (fwrite(BUFFER, 1, buff_len, file) != buff_len)
   {
     const int err = errno;
     fclose(file);
     DIE(err, "Failed to write to '%s': %s", output, strerror(err));
   }
   fclose(file);
+
+  file = fopen(logfile, "a");
+  LOG(file, "Execution_time for %s: %lu ms.\n", output,
+      (stop.tv_sec - start.tv_sec) * 1000 + (stop.tv_usec - start.tv_usec)/1000);
+  fclose(file);
+  free(BUFFER);
 
   return 0;
 }
